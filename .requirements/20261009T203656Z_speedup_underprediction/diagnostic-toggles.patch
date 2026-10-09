@@ -1,0 +1,430 @@
+diff --git a/libcoz/libcoz.cpp b/libcoz/libcoz.cpp
+index e1d34b8..4341b8d 100644
+--- a/libcoz/libcoz.cpp
++++ b/libcoz/libcoz.cpp
+@@ -100,7 +100,10 @@ static inline void lock_before_acquire() {
+ static inline void lock_after_acquire() {
+   if(coz_lock_depth < MaxTrackedLocks) {
+     coz_lock_since[coz_lock_depth] =
+-        initialized && profiler::get_instance().slowdown_active() ? get_monotonic_time() : 0;
++        initialized && (profiler::get_instance().slowdown_active() ||
++                        profiler::get_instance().section_credit_active())
++            ? get_monotonic_time()
++            : 0;
+   }
+   coz_lock_depth++;
+ }
+@@ -109,6 +112,11 @@ static inline void lock_before_release() {
+   if(!initialized) return;
+   profiler& p = profiler::get_instance();
+   if(!p.experiment_active()) return;
++  if(p.section_credit_active() && coz_lock_depth > 0 && coz_lock_depth <= MaxTrackedLocks) {
++    size_t since = coz_lock_since[coz_lock_depth - 1];
++    if(since && since < p.experiment_start_mono()) since = p.experiment_start_mono();
++    if(since) p.credit_section(get_monotonic_time() - since);
++  }
+   p.catch_up();
+   if(p.lock_aware_delays() && p.slowdown_active() && coz_lock_depth > 0 &&
+      coz_lock_depth <= MaxTrackedLocks) {
+@@ -434,6 +442,21 @@ void init_coz(void) {
+       control_socket.replace(pos, 2, to_string(getpid()));
+     profiler::get_instance().set_control_socket(control_socket);
+   }
++  // coz-mcp: sampling period (ns of thread CPU time) and diagnostics toggles
++  size_t sample_period = atol(getenv_safe("COZ_SAMPLE_PERIOD_NS", "0").c_str());
++  if(sample_period > 0) profiler::get_instance().set_sample_period(sample_period);
++  profiler::get_instance().set_timer_slack(atol(getenv_safe("COZ_TIMER_SLACK_NS", "0").c_str()));
++  string credit = getenv_safe("COZ_SPEEDUP_CREDIT", "sample");
++  profiler::get_instance().set_speedup_credit(
++      credit == "spread" ? profiler::speedup_credit::spread
++      : credit == "hold" ? profiler::speedup_credit::hold
++                         : profiler::speedup_credit::sample);
++  profiler::get_instance().set_spin_pause(atol(getenv_safe("COZ_SPIN_PAUSE_NS", "0").c_str()));
++  string overshoot = getenv_safe("COZ_PAUSE_OVERSHOOT", "propagate");
++  profiler::get_instance().set_overshoot_mode(
++      overshoot == "bank"   ? profiler::overshoot_mode::bank
++      : overshoot == "drop" ? profiler::overshoot_mode::drop
++                            : profiler::overshoot_mode::propagate);
+   profiler::get_instance().set_sample_event(
+       getenv_safe("COZ_SAMPLE_EVENT", control_socket.empty() ? "task-clock" : "ref-cycles"));
+   profiler::get_instance().set_lock_aware_delays(
+diff --git a/libcoz/profiler.cpp b/libcoz/profiler.cpp
+index d929c7f..6a34428 100644
+--- a/libcoz/profiler.cpp
++++ b/libcoz/profiler.cpp
+@@ -7,6 +7,10 @@
+ 
+ #include "profiler.h"
+ 
++#ifndef __APPLE__
++#include <sys/prctl.h>
++#endif
++
+ #ifndef __APPLE__
+   #include <asm/unistd.h>
+ #else
+@@ -620,6 +624,7 @@ void* profiler::start_thread(void* p) {
+ 
+ void profiler::begin_sampling(thread_state* state) {
+ #ifndef __APPLE__
++  if(_timer_slack > 0) prctl(PR_SET_TIMERSLACK, _timer_slack, 0, 0, 0);
+   // Set the perf_event sampler configuration (Linux)
+   struct perf_event_attr pe;
+   memset(&pe, 0, sizeof(pe));
+@@ -635,7 +640,7 @@ void profiler::begin_sampling(thread_state* state) {
+   // Create this thread's perf_event sampler and start sampling
+   state->sampler = perf_event(pe);
+   state->process_timer = timer(SampleSignal);
+-  state->process_timer.start_interval(SamplePeriod * SampleBatchSize);
++  state->process_timer.start_interval(_sample_period * SampleBatchSize);
+   state->sampler.start();
+ #else
+   // macOS version using timer-based sampling
+@@ -725,6 +730,7 @@ void profiler::add_delays(thread_state* state) {
+ #else
+       // Thread is ahead: increase the global delay time to make other threads pause
+       _global_delay.fetch_add(local - global_delay);
++      _dc.pushed_ns.fetch_add(local - global_delay, std::memory_order_relaxed);
+ #endif
+ 
+     } else if(local < global_delay) {
+@@ -732,16 +738,42 @@ void profiler::add_delays(thread_state* state) {
+ 
+       size_t needed = global_delay - local;
+ 
++      // coz-mcp: pay from time this thread already over-slept.
++      if(_overshoot_mode == overshoot_mode::bank && state->overshoot_bank > 0) {
++        size_t use = state->overshoot_bank < needed ? state->overshoot_bank : needed;
++        state->overshoot_bank -= use;
++        state->local_delay.fetch_add(use);
++        _dc.banked_used_ns.fetch_add(use, std::memory_order_relaxed);
++        needed -= use;
++        if(needed == 0) return;
++      }
++
+       // coz-mcp: a thread that pays virtual delays while holding a lock also
+       // stalls every thread waiting for that lock, which a real speedup would
+       // never do (waiters skip delays inserted while they were blocked, so this
+       // time is never accounted). Defer the payment until the thread holds no
+       // lock, but not without bound, or a long lock holder would never pay.
+-      if(_lock_aware_delays && coz_lock_depth > 0 && needed < MaxDeferredDelay) return;
++      if(_lock_aware_delays && coz_lock_depth > 0 && needed < MaxDeferredDelay) {
++        _dc.deferred.fetch_add(1, std::memory_order_relaxed);
++        return;
++      }
+ 
+       // Pause and record the exact amount of time this thread paused
+       state->sampler.stop();
+-      size_t waited = wait(needed);
++      size_t waited;
++      if(needed <= _spin_pause) {
++        // coz-mcp: nanosleep overshoots by tens of microseconds; spin short pauses.
++        size_t start = get_time();
++        size_t now = start;
++        while(now - start < needed) {
++          __builtin_ia32_pause();
++          now = get_time();
++        }
++        waited = now - start;
++        _dc.spins.fetch_add(1, std::memory_order_relaxed);
++      } else {
++        waited = wait(needed);
++      }
+ #ifdef __APPLE__
+       // Cap the increment to prevent nanosleep overshoot from inflating delays.
+       // macOS nanosleep has ~1ms granularity, and overshoot would propagate
+@@ -753,8 +785,21 @@ void profiler::add_delays(thread_state* state) {
+       }
+       g_delays_applied.fetch_add(1, std::memory_order_relaxed);
+ #else
+-      state->local_delay.fetch_add(waited);
++      if(_overshoot_mode == overshoot_mode::propagate) {
++        state->local_delay.fetch_add(waited);
++      } else {
++        state->local_delay.fetch_add(needed);
++        if(_overshoot_mode == overshoot_mode::bank && waited > needed)
++          state->overshoot_bank += waited - needed;
++      }
+ #endif
++      _dc.pauses.fetch_add(1, std::memory_order_relaxed);
++      _dc.paused_ns.fetch_add(waited, std::memory_order_relaxed);
++      if(waited > needed) _dc.overshoot_ns.fetch_add(waited - needed, std::memory_order_relaxed);
++      if(coz_lock_depth > 0) {
++        _dc.paused_in_lock.fetch_add(1, std::memory_order_relaxed);
++        _dc.paused_in_lock_ns.fetch_add(waited, std::memory_order_relaxed);
++      }
+       state->sampler.start();
+     }
+ 
+@@ -777,7 +822,16 @@ void profiler::process_samples(thread_state* state) {
+       if(_experiment_active) {
+         // Add a delay if the sample is in the selected line
+         if(sampled_line.second) {
+-          state->local_delay.fetch_add(_delay_size.load());
++          size_t d = _delay_size.load();
++          if(d > 0 && _lock_aware_delays && coz_lock_depth > 0 &&
++             _speedup_credit != speedup_credit::sample) {
++            // coz-mcp: credited per critical section at release
++            check_slowdown_epoch(state);
++            if(_speedup_credit == speedup_credit::spread) state->speedup_credit_in += d;
++          } else {
++            state->local_delay.fetch_add(d);
++          }
++          _dc.sample_credit_ns.fetch_add(d, std::memory_order_relaxed);
+           selected_hits++;
+         }
+ 
+@@ -1069,7 +1123,7 @@ public:
+     _kind = kind;
+     _percent = percent;
+     _has_pending = false;
+-    size_t size = (size_t)SamplePeriod * percent / 100;
++    size_t size = _p._sample_period * percent / 100;
+ 
+     // Publish the experiment parameters before activating it.
+     _p._selected_line.store(_selected);
+@@ -1084,6 +1138,7 @@ public:
+     _start_delay = _p._global_delay.load();
+     _start_slowdown = _p._slowdown_total.load();
+     _start_samples = _selected->get_samples();
++    _start_counters = counters();
+     _deadline = _start_time + (size_t)(max_duration_s * 1e9);
+     _p._experiment_active.store(true);
+     _active = true;
+@@ -1142,6 +1197,7 @@ public:
+     size_t delay = _p._global_delay.load() - _start_delay;
+     size_t slowdown = _p._slowdown_total.load() - _start_slowdown;
+     size_t samples = _selected->get_samples() - _start_samples;
++    vector<size_t> c = counters();
+ 
+     _p._experiment_active.store(false);
+     _p._delay_size.store(0);
+@@ -1157,6 +1213,12 @@ public:
+     r += ",\"global_delay_ns_delta\":" + to_string(delay);
+     r += ",\"slowdown_ns_delta\":" + to_string(slowdown);
+     r += ",\"selected_samples\":" + to_string(samples);
++    r += ",\"delay_counters\":{";
++    for(size_t i = 0; i < c.size(); i++) {
++      if(i > 0) r += ",";
++      r += string("\"") + counter_name(i) + "\":" + to_string(c[i] - _start_counters[i]);
++    }
++    r += "}";
+     r += string(",\"auto_stopped\":") + (auto_stopped ? "true" : "false");
+     r += "}";
+ 
+@@ -1166,6 +1228,23 @@ public:
+   }
+ 
+ private:
++  static const char* counter_name(size_t i) {
++    static const char* const names[] = {
++      "sample_credit_ns", "pushed_ns", "pauses", "paused_ns", "overshoot_ns",
++      "deferred", "paused_in_lock", "paused_in_lock_ns", "skips", "skipped_ns",
++      "banked_used_ns", "section_credit_ns", "spins"};
++    return names[i];
++  }
++
++  vector<size_t> counters() const {
++    const profiler::delay_counters& d = _p._dc;
++    return {d.sample_credit_ns.load(), d.pushed_ns.load(), d.pauses.load(),
++            d.paused_ns.load(), d.overshoot_ns.load(), d.deferred.load(),
++            d.paused_in_lock.load(), d.paused_in_lock_ns.load(), d.skips.load(),
++            d.skipped_ns.load(), d.banked_used_ns.load(),
++            d.section_credit_ns.load(), d.spins.load()};
++  }
++
+   string kind_name() const {
+     return _kind == coz_control::experiment_kind::speedup ? "speedup"
+                                                           : "slowdown";
+@@ -1181,11 +1260,34 @@ private:
+   size_t _start_delay = 0;
+   size_t _start_slowdown = 0;
+   size_t _start_samples = 0;
++  vector<size_t> _start_counters;
+   size_t _deadline = 0;
+   bool _has_pending = false;
+   string _pending;
+ };
+ 
++void profiler::credit_section(size_t hold_ns) {
++  size_t size = _delay_size.load(std::memory_order_relaxed);
++  if(size == 0) return;
++  thread_state* state = get_thread_state();
++  if(!state) return;
++  state->set_in_use(true);
++  check_slowdown_epoch(state);
++  size_t slice = hold_ns * size / _sample_period;
++  if(_speedup_credit == speedup_credit::spread) {
++    // The sampled credit caps the total; a growing backlog is credited faster.
++    size_t& credit = state->speedup_credit_in;
++    if(credit > SlowdownBacklog && slice < credit / 64) slice = credit / 64;
++    if(slice > credit) slice = credit;
++    credit -= slice;
++  }
++  if(slice > 0) {
++    state->local_delay.fetch_add(slice);
++    _dc.section_credit_ns.fetch_add(slice, std::memory_order_relaxed);
++  }
++  state->set_in_use(false);
++}
++
+ void profiler::pay_slowdown_slice(bool inside, size_t segment_ns) {
+   size_t size = _slowdown_size.load(std::memory_order_relaxed);
+   if(size == 0) return;
+@@ -1197,7 +1299,7 @@ void profiler::pay_slowdown_slice(bool inside, size_t segment_ns) {
+   check_slowdown_epoch(state);
+   size_t& debt = inside ? state->slowdown_debt_in : state->slowdown_debt_out;
+   // percent% of the code segment that just ran; a growing backlog pays faster.
+-  size_t slice = segment_ns * size / SamplePeriod;
++  size_t slice = segment_ns * size / _sample_period;
+   if(debt > SlowdownBacklog && slice < debt / 64) slice = debt / 64;
+   if(slice > debt) slice = debt;
+   if(slice > 0) {
+@@ -1283,6 +1385,13 @@ static bool can_sample(uint32_t type, uint64_t config, uint64_t period) {
+ 
+ void profiler::set_sample_event(const string& name) {
+   uint64_t config;
++  if(name == "cpu-clock") {
++    _sample_event_type = PERF_TYPE_SOFTWARE;
++    _sample_event_config = PERF_COUNT_SW_CPU_CLOCK;
++    _sample_event_period = _sample_period;
++    _sample_event_name = name;
++    return;
++  }
+   if(name == "ref-cycles") {
+     config = PERF_COUNT_HW_REF_CPU_CYCLES;
+   } else if(name == "cycles") {
+@@ -1292,13 +1401,13 @@ void profiler::set_sample_event(const string& name) {
+     return;  // keep the software task clock
+   }
+   double rate = calibrate_rate(PERF_TYPE_HARDWARE, config);
+-  if(rate <= 0 || !can_sample(PERF_TYPE_HARDWARE, config, (uint64_t)(rate * SamplePeriod))) {
++  if(rate <= 0 || !can_sample(PERF_TYPE_HARDWARE, config, (uint64_t)(rate * _sample_period))) {
+     WARNING << "coz-mcp: " << name << " not available, sampling with task-clock";
+     return;
+   }
+   _sample_event_type = PERF_TYPE_HARDWARE;
+   _sample_event_config = config;
+-  _sample_event_period = (uint64_t)(rate * SamplePeriod);
++  _sample_event_period = (uint64_t)(rate * _sample_period);
+   _sample_event_name = name;
+ }
+ #else
+diff --git a/libcoz/profiler.h b/libcoz/profiler.h
+index 1212afc..8fc9917 100644
+--- a/libcoz/profiler.h
++++ b/libcoz/profiler.h
+@@ -88,6 +88,8 @@ public:
+       state->slowdown_epoch = epoch;
+       state->slowdown_debt_in = 0;
+       state->slowdown_debt_out = 0;
++      state->overshoot_bank = 0;
++      state->speedup_credit_in = 0;
+     }
+   }
+ 
+@@ -101,6 +103,47 @@ public:
+   /// "cycles"). Call before startup().
+   void set_sample_event(const std::string& name);
+ 
++  /// coz-mcp: sampling period in ns of thread CPU time (default SamplePeriod).
++  /// Virtual delays are sized per sample, so a shorter period pays them in
++  /// smaller pieces. Call before set_sample_event() and startup().
++  void set_sample_period(size_t ns) {
++    if(ns > 0) _sample_period = _sample_event_period = ns;
++  }
++
++  /// coz-mcp: what to do with time a pause sleeps beyond what was needed.
++  enum class overshoot_mode {
++    propagate,  //< upstream: the thread is ahead, so every other thread pauses too
++    drop,       //< diagnostics: forget it (the thread really lost that time)
++    bank        //< keep it for this thread and pay its next delays from it
++  };
++  void set_overshoot_mode(overshoot_mode m) { _overshoot_mode = m; }
++
++  /// coz-mcp: how selected-line samples taken inside a lock become delay.
++  enum class speedup_credit {
++    sample,  //< upstream: one delay of percent% of the sample period per sample
++    spread,  //< earned per sample, credited percent% of each critical section at release
++    hold     //< diagnostics: percent% of every critical section, ignoring samples
++  };
++  void set_speedup_credit(speedup_credit c) { _speedup_credit = c; }
++
++  /// coz-mcp: pauses up to this long spin instead of sleeping (0 = never)
++  void set_spin_pause(size_t ns) { _spin_pause = ns; }
++
++  /// coz-mcp: is a speedup experiment running whose delays are credited per
++  /// critical section?
++  bool section_credit_active() const {
++    return _lock_aware_delays && _speedup_credit != speedup_credit::sample &&
++           _delay_size.load(std::memory_order_relaxed) > 0 &&
++           _experiment_active.load(std::memory_order_relaxed);
++  }
++
++  /// coz-mcp: credit virtual delay for a critical section of hold_ns that is
++  /// about to end (call before a release, then catch_up()).
++  void credit_section(size_t hold_ns);
++
++  /// coz-mcp: timer slack (ns) for sampled threads; 0 keeps the default.
++  void set_timer_slack(size_t ns) { _timer_slack = ns; }
++
+   /// coz-mcp: defer virtual delay payments while the thread holds a lock
+   void set_lock_aware_delays(bool on) { _lock_aware_delays = on; }
+   bool lock_aware_delays() const { return _lock_aware_delays; }
+@@ -258,7 +301,12 @@ public:
+ 
+     if(skip_delays) {
+       // Skip all delays that were inserted during the blocked period
+-      state->local_delay.fetch_add(_global_delay.load() - state->pre_block_time);
++      size_t skipped = _global_delay.load() - state->pre_block_time;
++      state->local_delay.fetch_add(skipped);
++      if(skipped > 0) {
++        _dc.skips.fetch_add(1, std::memory_order_relaxed);
++        _dc.skipped_ns.fetch_add(skipped, std::memory_order_relaxed);
++      }
+     }
+ 
+     // Must clear is_blocked before process_samples() because add_delays()
+@@ -362,6 +410,29 @@ private:
+   uint32_t _sample_event_type = 1;         //< PERF_TYPE_SOFTWARE
+   uint64_t _sample_event_config = 1;       //< PERF_COUNT_SW_TASK_CLOCK
+   uint64_t _sample_event_period = SamplePeriod;
++  size_t _sample_period = SamplePeriod;    //< Sampling period in ns of CPU time
++  overshoot_mode _overshoot_mode = overshoot_mode::propagate;
++  speedup_credit _speedup_credit = speedup_credit::sample;
++  size_t _spin_pause = 0;                  //< Pauses up to this long spin
++  size_t _timer_slack = 0;                 //< Timer slack for sampled threads (0 = default)
++
++  /// coz-mcp diagnostics: how virtual delays were inserted, paid and skipped
++  /// (cumulative; "stop" reports the change during the experiment).
++  struct delay_counters {
++    std::atomic<size_t> sample_credit_ns{0};  //< credited for selected-line samples
++    std::atomic<size_t> pushed_ns{0};         //< added to the global delay by threads ahead
++    std::atomic<size_t> pauses{0};            //< number of pauses
++    std::atomic<size_t> paused_ns{0};         //< time actually paused
++    std::atomic<size_t> overshoot_ns{0};      //< paused beyond what was needed
++    std::atomic<size_t> deferred{0};          //< payments deferred while holding a lock
++    std::atomic<size_t> paused_in_lock{0};    //< pauses while holding a lock
++    std::atomic<size_t> paused_in_lock_ns{0};
++    std::atomic<size_t> skips{0};             //< wake-ups that skipped delays
++    std::atomic<size_t> skipped_ns{0};
++    std::atomic<size_t> banked_used_ns{0};    //< delays paid from over-slept time
++    std::atomic<size_t> section_credit_ns{0}; //< credited per critical section at release
++    std::atomic<size_t> spins{0};             //< pauses that spun instead of sleeping
++  } _dc;
+   std::string _sample_event_name = "task-clock";
+ };
+ 
+diff --git a/libcoz/thread_state.h b/libcoz/thread_state.h
+index 5fa91d4..b40e8eb 100644
+--- a/libcoz/thread_state.h
++++ b/libcoz/thread_state.h
+@@ -24,6 +24,8 @@ public:
+   size_t slowdown_debt_in = 0;          //< coz-mcp: slowdown owed for samples taken inside a lock
+   size_t slowdown_debt_out = 0;         //< coz-mcp: slowdown owed for samples taken outside locks
+   size_t slowdown_epoch = 0;            //< coz-mcp: experiment the debts belong to
++  size_t speedup_credit_in = 0;         //< coz-mcp: virtual delay earned inside locks, not yet credited
++  size_t overshoot_bank = 0;            //< coz-mcp: time paused beyond what was needed, not yet used
+ 
+   inline void set_in_use(bool value) {
+     in_use = value;

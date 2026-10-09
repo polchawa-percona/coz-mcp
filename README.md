@@ -98,20 +98,36 @@ without libcoz, ~7 ns with libcoz idle, ~75 ns with latch statistics on.
 ## Validation (demo, 4 threads, pinned)
 
 Each experiment is compared with the real change of the same code measured in
-the same session (`scripts/validate_demo.py`):
+the same session (`scripts/validate_demo.py`), both on the plain program and
+on the program with libcoz loaded but idle (quiet host, 2026-10-10):
 
-| case | coz-mcp | real change |
-|---|---|---|
-| slowdown 50% critical section, pthread | -39.7% | -30.9% |
-| slowdown 50% parallel code, pthread | -6.8% | -4.9% |
-| speedup 30% critical section, pthread | +29.9% | +40.9% |
-| slowdown 50% critical section, hooked spin lock | -30.9% | -29.7% |
-| speedup 30% critical section, hooked spin lock | +30.5% | +45.7% |
-| slowdown 50% critical section, spin lock without hooks | -8.4% | -29.6% |
+| case | coz-mcp | real, under libcoz | real, plain |
+|---|---|---|---|
+| slowdown 50% critical section, pthread | -39.8% | -31.4% | -34.1% |
+| slowdown 50% parallel code, pthread | -6.4% | -1.0% | -4.9% |
+| speedup 30% critical section, pthread | +37.7% | +31.1% | +40.6% |
+| slowdown 50% critical section, hooked spin lock | -26.4% | -29.1% | -29.4% |
+| speedup 30% critical section, hooked spin lock | +32.7% | +31.0% | +45.1% |
+| slowdown 50% critical section, spin lock without hooks | -7.6% | -32.2% | -29.7% |
 
-Slowdowns match the real change closely. Speedup predictions point the right
-way but under-estimate the gain by roughly a quarter to a third (the last
-checked case is at the edge of the tolerance; an earlier run gave +35%).
+Slowdowns match the real change. Speedup predictions match the real change
+under libcoz but trail the plain program by 3-12 points on this host, and
+vary between runs (+29.9% for the pthread case in an earlier session). Two
+causes were found (`.requirements/*_speedup_underprediction/FINDINGS.md`):
+
+- Observer effect: the per-thread hardware perf event used for sampling
+  (ref-cycles; also cycles, or `perf stat` without libcoz) slows the faster
+  variant much more than the unchanged program on the AMD Zen5 test host, so
+  the program under libcoz gains ~30% from the change instead of ~41-45%.
+  Software clocks avoid it but attribute too few samples to the critical
+  section.
+- Pause overshoot propagation (upstream Coz): a paused thread credits its
+  nanosleep overshoot, so every other thread pauses for it too. During a
+  speedup the global delay grows ~5.7x faster than the samples justify and
+  the program runs at half speed, so results depend on sleep latency.
+  `COZ_PAUSE_OVERSHOOT=bank` removes this, but predicted speedups 5-10
+  points below the real change under libcoz on the demo, so it is opt-in.
+
 The last row shows why custom locks need the hooks. With upstream Coz
 semantics (`COZ_LOCK_AWARE_DELAYS=0 COZ_SAMPLE_EVENT=task-clock`) the first
 three rows were -9%, -65% and -4%.

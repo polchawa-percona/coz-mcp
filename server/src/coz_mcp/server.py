@@ -293,6 +293,7 @@ def build_server(coz: Any, workload: Any, latch_poll_s: float = 5.0) -> MCPServe
             "selected_samples": stopped.get("selected_samples"),
             "global_delay_ns": stopped.get("global_delay_ns_delta"),
             "slowdown_ns": stopped.get("slowdown_ns_delta"),
+            "delay_counters": stopped.get("delay_counters"),
             "warning": started.get("warning"),
         }
 

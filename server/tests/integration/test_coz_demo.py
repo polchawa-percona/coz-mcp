@@ -108,6 +108,27 @@ async def test_speedup_inserts_virtual_delay(tmp_path):
     assert r["auto_stopped"] is False
 
 
+@pytest.mark.parametrize("lock", ["pthread", "spin-hooked"])
+async def test_speedup_global_delay_matches_samples_with_bank(tmp_path, lock, monkeypatch):
+    """Pauses overshoot by tens of microseconds. Upstream credits the
+    overshoot, so every other thread pauses for it as well and the global
+    delay grows several times faster than the selected-line samples justify
+    (5.7x on a 4-thread demo). With COZ_PAUSE_OVERSHOOT=bank it must stay at
+    the sampled credit."""
+    monkeypatch.setenv("COZ_PAUSE_OVERSHOOT", "bank")
+    async with Demo(tmp_path, ["--threads=4", f"--lock={lock}", "--time=60"]) as d:
+        await asyncio.sleep(1)
+        await d.coz.request("start", line=demo_line("S"), kind="speedup", percent=30)
+        await asyncio.sleep(3)
+        r = await d.coz.request("stop")
+    c = r["delay_counters"]
+    assert c["sample_credit_ns"] > 0, r
+    assert c["pauses"] > 0, r
+    assert r["global_delay_ns_delta"] <= 1.2 * c["sample_credit_ns"], r
+    assert c["pushed_ns"] <= 1.2 * c["sample_credit_ns"], r
+    assert c["paused_in_lock"] == 0, r
+
+
 async def test_slowdown_sleeps_without_virtual_delay(tmp_path):
     async with Demo(tmp_path, ["--threads=4", "--time=60"]) as d:
         await asyncio.sleep(1)

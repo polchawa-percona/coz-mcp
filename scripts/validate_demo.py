@@ -11,8 +11,17 @@ really is longer/shorter (--serial-work-pct / --parallel-work-pct). Both
 deltas are measured in the same session with the demo pinned to the same
 CPUs, so machine drift cancels out.
 
+The real change is measured twice: on the plain program, and on the same
+program with libcoz loaded but no experiment running ("under libcoz"). Coz can
+only predict the program it runs in. On some hosts the per-thread hardware
+perf event that libcoz samples with changes the program itself: on an AMD
+Zen5 host it cut the real gain of the speedup cases from about +41% to about
++29% (see .requirements/*_speedup_underprediction/FINDINGS.md).
+
 A case passes when |coz delta - real delta| <= max(5 points, |real| / 3)
-(tolerance is an estimate, see REQUIREMENTS R13).
+(tolerance is an estimate, see REQUIREMENTS R13). The exit code uses the real
+change of the plain program; the verdict against the program under libcoz is
+printed for information.
 """
 
 from __future__ import annotations
@@ -29,11 +38,11 @@ from pathlib import Path
 
 from mcp import Client
 
-from coz_mcp.config import demo_workload
+from coz_mcp.config import coz_env, demo_workload
 from coz_mcp.control import CozControl
 from coz_mcp.server import build_server
 from coz_mcp.stats import compare
-from coz_mcp.workload import Workload
+from coz_mcp.workload import Workload, _child_setup
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -104,21 +113,30 @@ class Runner:
             await coz.close()
             return r.structured_content["summary"]
 
-    async def plain_tps(self, args: list[str]) -> float:
+    async def plain_tps(self, args: list[str], under_coz: bool = False) -> float:
         cmd = [str(self.build / "demo/demo"), self.threads, *args,
                f"--time={int(self.duration) + 1}"]
-        if self.cpus:
-            cmd = ["taskset", "-c", self.cpus, *cmd]
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE)
-        out, _ = await proc.communicate()
+        with tempfile.TemporaryDirectory() as tmp:
+            env = None
+            if under_coz:
+                # libcoz loaded, no experiment: nobody connects to the socket.
+                env = {**os.environ,
+                       **coz_env(self.build, os.path.join(tmp, "coz.sock"),
+                                 os.path.join(tmp, "p.coz")),
+                       **self.extra_env}
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                env=env, preexec_fn=_child_setup(self.cpus))
+            out, _ = await proc.communicate()
         rates = [float(m) for m in re.findall(r"tps: ([0-9.]+)", out.decode())]
         return statistics.fmean(rates[1:])  # skip the startup second
 
-    async def real_delta(self, c: Case) -> dict:
+    async def real_delta(self, c: Case, under_coz: bool = False) -> dict:
         base, variant = [], []
         for _ in range(self.repeats):
-            base.append(await self.plain_tps([f"--lock={c.lock}"]))
-            variant.append(await self.plain_tps([f"--lock={c.lock}", c.truth_flag]))
+            base.append(await self.plain_tps([f"--lock={c.lock}"], under_coz))
+            variant.append(await self.plain_tps([f"--lock={c.lock}", c.truth_flag],
+                                                 under_coz))
         return compare(base, variant)
 
 
@@ -142,20 +160,27 @@ async def main() -> int:
     a = ap.parse_args()
     r = Runner(a)
 
-    print(f"{'case':30s} {'coz-mcp':>24s} {'real change':>24s}  verdict")
+    print(f"{'case':30s} {'coz-mcp':>24s} {'real, under libcoz':>24s} "
+          f"{'real, plain':>24s}  verdict (libcoz/plain)")
     ok = True
     for c in CASES:
         if a.only and a.only not in c.name:
             continue
         coz = await r.coz_delta(c)
+        real_coz = await r.real_delta(c, under_coz=True)
         real = await r.real_delta(c)
-        diff = abs(coz["delta_pct"] - real["delta_pct"])
-        passed = diff <= max(5.0, abs(real["delta_pct"]) / 3)
-        verdict = ("PASS" if passed else "FAIL") if c.checked else "info"
+
+        def verdict(truth: dict) -> tuple[bool, str]:
+            diff = abs(coz["delta_pct"] - truth["delta_pct"])
+            passed = diff <= max(5.0, abs(truth["delta_pct"]) / 3)
+            return passed, ("PASS" if passed else "FAIL") if c.checked else "info"
+
+        _, v_coz = verdict(real_coz)
+        passed, v_plain = verdict(real)
         if c.checked:
             ok &= passed
-        print(f"{c.name:30s} {fmt(coz):>24s} {fmt(real):>24s}  {verdict} "
-              f"({c.truth_flag})", flush=True)
+        print(f"{c.name:30s} {fmt(coz):>24s} {fmt(real_coz):>24s} {fmt(real):>24s}  "
+              f"{v_coz}/{v_plain} ({c.truth_flag})", flush=True)
     return 0 if ok else 1
 
 

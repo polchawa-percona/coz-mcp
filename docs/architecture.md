@@ -152,6 +152,27 @@ whenever the selected line runs ("virtual speedup"). coz-mcp's fork adds:
 `COZ_LOCK_AWARE_DELAYS=0 COZ_SAMPLE_EVENT=task-clock` restores upstream
 behaviour.
 
+Option `COZ_PAUSE_OVERSHOOT=bank` (default `propagate`, as upstream): a
+thread credits only the delay it needed and pays its next delays from the
+time nanosleep over-slept. Upstream credits the whole sleep, which puts the
+thread ahead, so every other thread pauses for the overshoot and overshoots
+in turn; on the 4-thread demo the global delay grows 5.7x faster than the
+samples justify and the program runs at half speed during a speedup
+experiment. Bank keeps the global delay at the sampled credit, but its
+speedup predictions on the demo were 5-10 points below the real change
+measured under libcoz, so it is not the default yet.
+
+The `stop` reply carries `delay_counters` (credit from samples, global delay
+pushed, pauses, overshoot, deferred payments, skipped delays), which
+`run_experiment` returns per run.
+
+Known limitation: the per-thread hardware perf event used for sampling can
+change the program. On an AMD Zen5 host it slowed the demo with a 30% faster
+critical section by 12-17% but the unchanged demo by only ~3% (also with
+`perf stat -e ref-cycles` and no libcoz), so the real gain of that change is
+~29% under libcoz versus ~41% without it. Coz predicts the instrumented
+program; `scripts/validate_demo.py` reports both ground truths.
+
 ## Throughput measurement
 
 Coz normally counts progress points inside the program. coz-mcp instead uses
