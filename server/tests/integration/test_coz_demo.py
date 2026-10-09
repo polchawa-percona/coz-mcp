@@ -215,3 +215,30 @@ async def test_latch_top_on_demo(tmp_path):
     assert 500 < top["avg_ns"] < 100_000, top
     _, wait1, _ = await _latch_top(tmp_path / "t1", 1)
     assert wait["latches"][0]["avg_ns"] > 2 * wait1["latches"][0]["avg_ns"], (wait, wait1)
+
+
+async def test_stdio_server_like_claude_code(tmp_path):
+    """Launch `coz-mcp` over stdio exactly as an MCP client config would."""
+    import sys
+
+    from mcp import Client, StdioServerParameters
+
+    params = StdioServerParameters(
+        command="uv",
+        args=["--directory", str(REPO / "server"), "run", "coz-mcp"],
+        env={**os.environ, "COZ_MCP_WORKLOAD": "demo", "COZ_MCP_BUILD_DIR": str(BUILD),
+             "COZ_MCP_SOCKET": str(tmp_path / "coz.sock"),
+             "COZ_MCP_PROFILE": str(tmp_path / "p.coz")},
+    )
+    async with Client(params) as c:
+        tools = {t.name for t in (await c.list_tools()).tools}
+        assert "run_experiment" in tools
+        r = await c.call_tool("start_workload", {"args": ["--threads=2", "--time=30"]})
+        assert not r.is_error, r.content
+        async with asyncio.timeout(20):
+            while not (tmp_path / "coz.sock").exists():
+                await asyncio.sleep(0.05)
+        st = (await c.call_tool("coz_status", {})).structured_content
+        assert st["coz"]["mode"] == "manual"
+        assert st["coz"]["sample_event"] == "ref-cycles"
+        await c.call_tool("stop_workload", {})

@@ -340,3 +340,32 @@ per-reader tracking for rwlocks.
   review subagent and the advisor instead.
 - User action needed before integration steps (6+): `sudo sysctl
   kernel.perf_event_paranoid=1` and `sudo apt install sysbench`.
+
+## Deviations found during implementation (2026-10-09)
+
+- R5 (speedup accounting unchanged) was not kept. Validation against real code
+  changes on the demo showed upstream semantics give wrong answers for
+  lock-bound code (slowdown of the critical section -9% vs real -30%, slowdown
+  of parallel code -65% vs -4%, speedup +30% predicted -4% vs real +42%).
+  Changes in the fork, on by default in control mode and switchable back to
+  upstream behaviour (`COZ_LOCK_AWARE_DELAYS=0`, `COZ_SAMPLE_EVENT=task-clock`):
+  - virtual delays are deferred while a thread holds a lock (pthread or
+    COZ_LATCH_*), bounded by 20 ms; samples are drained before each acquire;
+    latch waits count as blocked; pre_block/post_block nest;
+  - slowdown debt is paid by spinning, in proportion to each critical section
+    (or to the code since the last release), instead of 0.5 ms sleeps per
+    sample;
+  - sampling uses ref-cycles (period calibrated to 1 ms of CPU time) because
+    the software task clock under-sampled code just before a lock handoff
+    (5% instead of 26% of the samples on the demo).
+  After the fixes all checked validation cases agree with the real change
+  within max(5 points, 1/3 of the real change).
+- R2: manual experiments are written to the profile as `manual-experiment`
+  records (both kinds) rather than upstream `experiment` records, because
+  without progress points upstream records carry no throughput.
+- R13 became a paired comparison with ground truth measured in the same
+  session (`scripts/validate_demo.py`) instead of fixed thresholds.
+- R19 measured on the demo (single thread, estimates): ~0 ns per lock/unlock
+  pair without libcoz, ~7 ns with libcoz idle, ~75 ns with latch stats on.
+- Coz exports `_coz_add_delays` (not `coz_catch_up`, which is macOS-only); the
+  latch hooks call into libcoz through the new `_coz_get_latch_api` table.
