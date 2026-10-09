@@ -180,3 +180,38 @@ async def test_mcp_run_experiment_on_demo(tmp_path):
         assert s["delta_pct"] < -15, s
         r = await c.call_tool("stop_workload", {})
     await d.coz.close()
+
+
+async def _latch_top(tmp_path, threads):
+    from mcp import Client
+
+    from coz_mcp.server import build_server
+
+    tmp_path.mkdir(exist_ok=True)
+    d = Demo(tmp_path, [])
+    async with Client(build_server(d.coz, d.workload, latch_poll_s=0)) as c:
+        r = await c.call_tool("start_workload", {
+            "args": [f"--threads={threads}", "--lock=spin-hooked", "--time=60"]})
+        assert not r.is_error, r.content
+        async with asyncio.timeout(20):
+            while not os.path.exists(d.sock):
+                await asyncio.sleep(0.05)
+        await asyncio.sleep(1)
+        assert not (await c.call_tool("latch_stats_enable", {"on": True})).is_error
+        hold = (await c.call_tool("latch_top", {"metric": "hold", "window_s": 2})).structured_content
+        wait = (await c.call_tool("latch_top", {"metric": "wait", "window_s": 2})).structured_content
+        tps = (await c.call_tool("workload_tps", {"last_s": 2})).structured_content["mean_tps"]
+        await c.call_tool("stop_workload", {})
+    await d.coz.close()
+    return hold, wait, tps
+
+
+async def test_latch_top_on_demo(tmp_path):
+    hold, wait, tps = await _latch_top(tmp_path / "t4", 4)
+    top = hold["latches"][0]
+    assert top["name"] == "demo_lock"
+    assert "demo.cc:" in top["site"]
+    assert abs(top["count_per_s"] - tps) / tps < 0.2, (top, tps)
+    assert 500 < top["avg_ns"] < 100_000, top
+    _, wait1, _ = await _latch_top(tmp_path / "t1", 1)
+    assert wait["latches"][0]["avg_ns"] > 2 * wait1["latches"][0]["avg_ns"], (wait, wait1)

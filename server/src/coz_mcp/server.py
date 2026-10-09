@@ -29,12 +29,14 @@ from mcp.server.subscriptions import InMemorySubscriptionBus
 from mcp.shared.subscriptions import ResourceUpdated
 
 from .control import CozError, CozUnavailable
+from .latch import rank_latches
 from .metrics import window_tps
 from .stats import compare
 from .workload import WorkloadError
 
 EXPERIMENTS_URI = "coz://experiments"
 HOT_LINES_URI = "coz://hot-lines"
+LATCHES_URI = "coz://latches/top"
 
 INSTRUCTIONS = """\
 Drive Coz causal-profiling experiments on a running program under load.
@@ -42,6 +44,8 @@ Typical flow: start_workload -> wait for stable TPS (workload_tps) -> hot_lines
 -> run_experiment on candidate lines (slowdown shows whether a line matters,
 speedup predicts the gain from optimizing it) -> compare delta_pct and its
 confidence interval. Only one experiment runs at a time.
+For lock contention: latch_stats_enable, then latch_top ranks mutex/rw-latch
+acquire sites by wait or hold time (needs latch hooks in the target).
 """
 
 
@@ -54,6 +58,8 @@ class App:
         self.bus = bus
         self.experiments: list[dict[str, Any]] = []
         self.hot_lines: dict[str, Any] = {"lines": []}
+        self.latches: dict[str, Any] = {"wait": None, "hold": None}
+        self.latch_enabled = False
         self.experiment_lock = asyncio.Lock()
 
     async def coz_request(self, cmd: str, **args: Any) -> dict[str, Any]:
@@ -83,11 +89,30 @@ def build_server(coz: Any, workload: Any, latch_poll_s: float = 5.0) -> MCPServe
     bus = InMemorySubscriptionBus()
     app = App(coz, workload, bus)
 
+    async def latch_poller() -> None:
+        """Refresh coz://latches/top while latch stats are enabled."""
+        while True:
+            await asyncio.sleep(latch_poll_s)
+            if not app.latch_enabled:
+                continue
+            try:
+                before = await app.coz.request("latch_stats_snapshot")
+                await asyncio.sleep(latch_poll_s)
+                after = await app.coz.request("latch_stats_snapshot")
+            except (CozError, CozUnavailable):
+                continue
+            for metric in ("wait", "hold"):
+                app.latches[metric] = rank_latches(before, after, metric=metric)
+            await app.publish(LATCHES_URI)
+
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncIterator[App]:
+        poller = asyncio.create_task(latch_poller()) if latch_poll_s > 0 else None
         try:
             yield app
         finally:
+            if poller:
+                poller.cancel()
             # Never leave a benchmark running or a target slowed down.
             with contextlib.suppress(Exception):
                 if app.experiment_lock.locked():
@@ -278,6 +303,54 @@ def build_server(coz: Any, workload: Any, latch_poll_s: float = 5.0) -> MCPServe
                        "samples).")
         return out
 
+    @mcp.tool()
+    async def latch_stats_enable(on: bool = True) -> dict[str, Any]:
+        """Turn per-site latch wait/hold statistics on or off in the target.
+
+        Needs a target built with latch hooks (COZ_LATCH_* in coz.h, e.g.
+        Percona Server built with -DWITH_COZ=ON). Costs a few tens of ns per
+        latch operation while on.
+        """
+        r = await app.coz_request("latch_stats", enable=on)
+        app.latch_enabled = on
+        return r
+
+    @mcp.tool()
+    async def latch_stats_reset() -> dict[str, Any]:
+        """Zero all latch statistics (including the max values)."""
+        return await app.coz_request("latch_stats_reset")
+
+    @mcp.tool()
+    async def latch_top(metric: Literal["wait", "hold"] = "hold", window_s: float = 5,
+                        limit: int = 20, latch: str | None = None,
+                        path_filter: str | None = None) -> dict[str, Any]:
+        """Rank mutex/rw-latch acquire sites by time over the last window_s seconds.
+
+        metric=wait: time threads spent waiting to acquire at that site
+        (contention); metric=hold: time the latch was held after being
+        acquired there (critical section length). Per site: acquisitions/s,
+        total ms per second, average, p50/p99 (log2 histogram upper bounds) and
+        max since reset. latch filters by latch name, path_filter by file.
+        """
+        if not app.latch_enabled:
+            raise ToolError("latch statistics are off; call latch_stats_enable first")
+        before = await app.coz_request("latch_stats_snapshot")
+        await asyncio.sleep(window_s)
+        after = await app.coz_request("latch_stats_snapshot")
+        r = rank_latches(before, after, metric=metric, limit=limit, latch=latch,
+                         path_filter=path_filter)
+        caveats = ["Hold time covers the whole critical section, not only the "
+                   "acquire line; use hot_lines to find the expensive lines inside."]
+        if app.experiment_lock.locked():
+            caveats.append("An experiment is running: times include injected "
+                           "slowdown or Coz virtual delays.")
+        if r["reset_detected"]:
+            caveats.append("Counters were reset during the window.")
+        r["caveats"] = caveats
+        app.latches[metric] = r
+        await app.publish(LATCHES_URI)
+        return r
+
     # ------------------------------------------------------------- resources
 
     @mcp.resource(EXPERIMENTS_URI, name="experiments", mime_type="application/json",
@@ -289,6 +362,12 @@ def build_server(coz: Any, workload: Any, latch_poll_s: float = 5.0) -> MCPServe
                   description="Hot lines from the latest hot_lines call.")
     def hot_lines_resource() -> str:
         return json.dumps(app.hot_lines, indent=1)
+
+    @mcp.resource(LATCHES_URI, name="latches-top", mime_type="application/json",
+                  description="Latest latch wait and hold rankings (refreshed "
+                              "in the background while latch stats are on).")
+    def latches_resource() -> str:
+        return json.dumps(app.latches, indent=1)
 
     # --------------------------------------------------------------- prompts
 

@@ -21,6 +21,8 @@ class FakeCoz:
         self.active = None  # (kind, percent)
         self.delay = 0
         self.hot_calls = 0
+        self.latch_enabled = False
+        self.snapshots = 0
 
     async def request(self, cmd, **args):
         self.calls.append((cmd, args))
@@ -46,6 +48,23 @@ class FakeCoz:
             return {"kind": kind, "percent": pct, "global_delay_ns_delta": 0,
                     "slowdown_ns_delta": 1000, "selected_samples": 3,
                     "auto_stopped": False}
+        if cmd == "latch_stats":
+            self.latch_enabled = args["enable"]
+            return {"enabled": args["enable"]}
+        if cmd == "latch_stats_reset":
+            return {"reset": True}
+        if cmd == "latch_stats_snapshot":
+            self.snapshots += 1
+            k = self.snapshots
+            hist = [0] * 40
+            hist[11] = 10 * k
+            return {"enabled": self.latch_enabled, "now_ns": k * 1_000_000_000,
+                    "unmatched_releases": 0, "stack_overflows": 0, "latches": [
+                        {"site": "/src/trx0sys.cc:100", "name": "trx_sys_mutex",
+                         "mode": "mutex", "count": 10 * k, "wait_ns": 5000 * k,
+                         "wait_max_ns": 900, "hold_count": 10 * k,
+                         "hold_ns": 20000 * k, "hold_max_ns": 3000,
+                         "wait_hist": hist, "hold_hist": hist}]}
         raise CozError(f"unknown cmd: {cmd}")
 
     async def global_delay_ns(self):
@@ -240,3 +259,38 @@ async def test_find_bottleneck_prompt(client):
     p = await client.get_prompt("find_bottleneck", {"candidates": "3"})
     text = p.messages[0].content.text
     assert "hot_lines" in text and "run_experiment" in text and "3" in text
+
+
+async def test_latch_tools(client, fakes):
+    coz, _ = fakes
+    r = data(await client.call_tool("latch_stats_enable", {"on": True}))
+    assert r["enabled"] is True and coz.latch_enabled
+    top = data(await client.call_tool("latch_top", {"metric": "hold", "window_s": 0.01}))
+    row = top["latches"][0]
+    assert row["site"] == "/src/trx0sys.cc:100"
+    assert row["count_per_s"] == pytest.approx(10.0)
+    assert row["total_ms_per_s"] == pytest.approx(0.02)
+    assert "caveats" in top
+    text = (await client.read_resource("coz://latches/top")).contents[0].text
+    assert "trx_sys_mutex" in text
+    data(await client.call_tool("latch_stats_reset", {}))
+
+
+async def test_latch_top_requires_enabled_stats(client):
+    r = await client.call_tool("latch_top", {"window_s": 0.01})
+    assert r.is_error
+    assert "latch_stats_enable" in r.content[0].text
+
+
+async def test_latch_poller_publishes_updates(fakes):
+    coz, wl = fakes
+    server = build_server(coz=coz, workload=wl, latch_poll_s=0.05)
+    async with Client(server) as c:
+        await c.call_tool("latch_stats_enable", {"on": True})
+        async with c.listen(resource_subscriptions=["coz://latches/top"]) as sub:
+            async with asyncio.timeout(5):
+                async for event in sub:
+                    assert event.uri == "coz://latches/top"
+                    break
+        text = (await c.read_resource("coz://latches/top")).contents[0].text
+        assert "trx_sys_mutex" in json.loads(text)["hold"]["latches"][0]["name"]
