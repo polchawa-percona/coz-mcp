@@ -100,9 +100,10 @@ pay it too), 10,789 TPS with a 50% slowdown of `rem0cmp.cc:622` (record
 comparison during B-tree search).
 
 Known limitations:
-- Waits that only sleep and poll (e.g. `buf_LRU_get_free_block()` waiting
-  for the page cleaner to free a block, about 10,000 waits per minute in the
-  64M buffer pool smoke test below) are not seen.
+- Waits that only sleep and poll are not seen, e.g. `buf_LRU_get_free_block()`
+  when the free list is empty (page cleaner or the thread's own single-page
+  flush; `Innodb_buffer_pool_wait_free` grew by about 10,000 per minute in
+  the 64M buffer pool smoke test below, estimate).
 - Waits built on raw atomics instead of InnoDB latches or pthread primitives
   are not seen by the hooks.
 - Hook cost while latch statistics are on is noticeable under heavy load
@@ -135,21 +136,28 @@ runs outside Coz virtual time. With an older libcoz (v1 table only) hand-off
 latches are reported like other latches.
 
 `lock_depth_raised` counts threads with a non-zero depth at the snapshot.
-Threads parked in `pthread_cond_wait` (InnoDB `os_event` waits) hold the event
-mutex as far as libcoz is concerned, so an idle server shows about 30 such
-threads with depth 1; a missed release would instead grow a thread's depth
-without bound.
+The `pthread_mutex_lock` wrapper raises the depth and the `pthread_cond_wait`
+wrapper leaves it alone (libcoz.cpp), so threads parked in InnoDB `os_event`
+waits count as holding the event mutex: an idle server shows about 30 threads
+with depth 1. A missed release instead grows a thread's depth without bound:
+the old hooks (mysqld before the change) under the new libcoz left
+`lock_depth_max` at about 104,000 at idle (`held_now` 1,155), the new hooks at
+1 (`held_now` 0). The new mysqld under the old libcoz (v1 fallback) runs and
+behaves as before (about 1M unmatched releases).
 
 Smoke test (8 x 100k rows, `--innodb-buffer-pool-size=64M`, sysbench 32
 threads, mysqld on 8 CPUs, busy shared machine, single runs, estimates):
 
-| | before | after |
-|---|---|---|
-| unmatched releases / stack overflows after read_write | 1.58M / 1.58M | 0 / 0 |
-| hand-off acquires = releases (after idle) | n/a | 1.03M = 1.03M |
-| held latches at idle / max lock depth at idle | n/a | 0 / 1 |
-| oltp_read_only TPS, no experiment | 19,900 / 19,732 | 19,904 / 20,203 |
-| oltp_read_only TPS, 0% experiment | 18,316 / 17,752 | 18,296 / 17,691 |
+| | before | after | after (libcoz merged with 5ffaad5) |
+|---|---|---|---|
+| unmatched releases / stack overflows after read_write | 1.58M / 1.58M | 0 / 0 | 0 / 0 |
+| hand-off acquires = releases (after idle) | n/a | 1.03M = 1.03M | 1.02M = 1.02M |
+| held latches at idle / max lock depth at idle | n/a | 0 / 1 | 0 / 1 |
+| oltp_read_only TPS, no experiment | 19,900 / 19,732 | 19,904 / 20,203 | 20,071 / 18,159 |
+| oltp_read_only TPS, 0% experiment | 18,316 / 17,752 | 18,296 / 17,691 | 17,943 / 16,907 |
+
+The 0% experiment costs about 9-10% TPS in all three; the differences are
+within the noise of the shared machine.
 
 Read-only runs had no unmatched releases even before: single-page reads are
 synchronous, so the same thread acquires and releases the latch; the
