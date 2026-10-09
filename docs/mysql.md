@@ -100,11 +100,59 @@ pay it too), 10,789 TPS with a 50% slowdown of `rem0cmp.cc:622` (record
 comparison during B-tree search).
 
 Known limitations:
-- Latches released by another thread (e.g. page latches released by I/O
-  completion) show up as `unmatched_releases` and leave the owner's lock
-  depth counted as held.
+- Waits that only sleep and poll (e.g. `buf_LRU_get_free_block()` waiting
+  for the page cleaner to free a block, about 10,000 waits per minute in the
+  64M buffer pool smoke test below) are not seen.
 - Waits built on raw atomics instead of InnoDB latches or pthread primitives
   are not seen by the hooks.
 - Hook cost while latch statistics are on is noticeable under heavy load
   (about -14% TPS in the smoke test, estimate); baselines and experiments
   pay it equally.
+
+## Asynchronous I/O hand-offs
+
+InnoDB hands block latches over to asynchronous I/O with a non-zero pass value
+(page reads: X latch with `BUF_IO_READ`, page writes: SX latch with
+`BUF_IO_WRITE`); the I/O handler thread releases them when the I/O completes.
+The hooks on `PS-11508-8.4-coz-hooks` report every latch acquired with a
+non-zero pass value as a hand-off latch through libcoz's v2 hook table
+(`_coz_get_latch_api2`, coz branch `coz-mcp-aio-handoff`):
+
+- the acquisition ends the latch wait as usual but does not make the thread a
+  lock holder (its virtual delays are not deferred);
+- the release, on whichever thread, lets that thread catch up on Coz delays
+  before waiters wake and does not change any lock depth;
+- latch statistics record the wait at the acquire site but no hold time (the
+  time until release is I/O time); `latch_top` reports
+  `handoff_acquires_per_s`, `held_now`, `lock_depth_raised` and
+  `lock_depth_max`.
+
+Threads waiting for a page read wait on the block latch (`buf_wait_for_read`)
+and are bracketed by the latch hooks; the io_fix polling loop of
+`buf_page_get_zip` is bracketed with pre_block/post_block. The I/O threads'
+`io_getevents()` wait is deliberately not: it is ended by the device, which
+runs outside Coz virtual time. With an older libcoz (v1 table only) hand-off
+latches are reported like other latches.
+
+`lock_depth_raised` counts threads with a non-zero depth at the snapshot.
+Threads parked in `pthread_cond_wait` (InnoDB `os_event` waits) hold the event
+mutex as far as libcoz is concerned, so an idle server shows about 30 such
+threads with depth 1; a missed release would instead grow a thread's depth
+without bound.
+
+Smoke test (8 x 100k rows, `--innodb-buffer-pool-size=64M`, sysbench 32
+threads, mysqld on 8 CPUs, busy shared machine, single runs, estimates):
+
+| | before | after |
+|---|---|---|
+| unmatched releases / stack overflows after read_write | 1.58M / 1.58M | 0 / 0 |
+| hand-off acquires = releases (after idle) | n/a | 1.03M = 1.03M |
+| held latches at idle / max lock depth at idle | n/a | 0 / 1 |
+| oltp_read_only TPS, no experiment | 19,900 / 19,732 | 19,904 / 20,203 |
+| oltp_read_only TPS, 0% experiment | 18,316 / 17,752 | 18,296 / 17,691 |
+
+Read-only runs had no unmatched releases even before: single-page reads are
+synchronous, so the same thread acquires and releases the latch; the
+unmatched releases came from page writes (page cleaner SX latches released by
+write completion). Before the change those reads also showed up as long
+holds of `buf0buf.cc:5261` (the I/O time); they are now waits only.

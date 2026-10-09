@@ -61,7 +61,7 @@ def rank_latches(before: dict[str, Any], after: dict[str, Any], metric: Metric =
             "max_ns_since_reset": s[f"{metric}_max_ns"],
         })
     rows.sort(key=lambda r: -r["total_ms_per_s"])
-    return {
+    r: dict[str, Any] = {
         "metric": metric,
         "window_s": window_s,
         "latches": rows[:limit],
@@ -69,3 +69,13 @@ def rank_latches(before: dict[str, Any], after: dict[str, Any], metric: Metric =
         "stack_overflows": after.get("stack_overflows", 0),
         "reset_detected": reset,
     }
+    # Newer libcoz: hand-off latches (released by another thread, e.g. by I/O
+    # completion; waits only, no hold time) and the current lock depth of
+    # threads (a depth that stays raised means a release was missed).
+    if "handoff_acquires" in after:
+        r["handoff_acquires_per_s"] = max(
+            after["handoff_acquires"] - before.get("handoff_acquires", 0), 0) / window_s
+    for k in ("held_now", "lock_depth_raised", "lock_depth_max"):
+        if k in after:
+            r[k] = after[k]
+    return r

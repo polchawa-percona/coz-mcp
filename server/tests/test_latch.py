@@ -72,3 +72,18 @@ def test_counters_reset_between_snapshots_is_reported():
     after = snap(1_000_000_000, site("a", "x", 10, 100, 100))
     r = rank_latches(before, after, metric="hold")
     assert r["reset_detected"] is True
+
+
+def test_handoff_and_lock_depth_fields_passed_through():
+    before = dict(snap(0), handoff_acquires=100)
+    after = dict(snap(2_000_000_000, site("block", "x", 10, 100, 0)),
+                 handoff_acquires=500, held_now=3, lock_depth_raised=1,
+                 lock_depth_max=2)
+    r = rank_latches(before, after, metric="wait")
+    assert r["handoff_acquires_per_s"] == pytest.approx(200.0)
+    assert (r["held_now"], r["lock_depth_raised"], r["lock_depth_max"]) == (3, 1, 2)
+
+
+def test_old_libcoz_snapshot_has_no_handoff_fields():
+    r = rank_latches(snap(0), snap(1_000_000_000), metric="hold")
+    assert "handoff_acquires_per_s" not in r and "lock_depth_raised" not in r
