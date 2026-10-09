@@ -1,7 +1,7 @@
 [project]
 name = "coz-mcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "MCP server driving Coz causal-profiling experiments at runtime"
 readme = "README.md"
 authors = [
     { name = "Paweł Olchawa", email = "pawel.olchawa@percona.com" }
@@ -10,6 +10,9 @@ requires-python = ">=3.12"
 dependencies = [
     "mcp>=2",
 ]
+
+[project.scripts]
+coz-mcp = "coz_mcp.server:main"
 
 [build-system]
 requires = ["uv_build>=0.11.24,<0.12.0"]

@@ -154,3 +154,29 @@ async def test_slowdown_of_serial_section_lowers_tps(tmp_path):
     base = window_tps(samples, b0, b1, corrected=False).raw_tps
     slow = window_tps(samples, e0, e1, corrected=False).raw_tps
     assert slow < base * 0.85, (base, slow)
+
+
+async def test_mcp_run_experiment_on_demo(tmp_path):
+    """Full stack: MCP tools -> CozControl -> libcoz in the demo."""
+    from mcp import Client
+
+    from coz_mcp.server import build_server
+
+    d = Demo(tmp_path, [])
+    server = build_server(d.coz, d.workload)
+    async with Client(server) as c:
+        d.workload._delay_sampler = d.coz.global_delay_ns
+        r = await c.call_tool("start_workload", {"args": ["--threads=4", "--time=120"]})
+        assert not r.is_error, r.content
+        async with asyncio.timeout(20):
+            while not os.path.exists(d.sock):
+                await asyncio.sleep(0.05)
+        await asyncio.sleep(1)
+        r = await c.call_tool("run_experiment", {
+            "line": demo_line("S"), "kind": "slowdown", "percent": 50,
+            "duration_s": 3, "repeats": 2, "warmup_s": 1, "cooldown_s": 0})
+        assert not r.is_error, r.content
+        s = r.structured_content["summary"]
+        assert s["delta_pct"] < -15, s
+        r = await c.call_tool("stop_workload", {})
+    await d.coz.close()
