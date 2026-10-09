@@ -41,19 +41,21 @@ std::atomic<uint64_t> g_txns{0};
 // Opaque sink so the compiler cannot drop the work loops.
 std::atomic<uint64_t> g_sink{0};
 
+// Each work loop is on a single line so that all of its samples map to the
+// marked line.
+constexpr uint64_t kMulP = 6364136223846793005ULL;
+constexpr uint64_t kAddP = 1442695040888963407ULL;
+constexpr uint64_t kMulS = 0x9E3779B97F4A7C15ULL;
+
 __attribute__((noinline)) uint64_t parallel_work(uint64_t seed, int n) {
   uint64_t x = seed;
-  for (int i = 0; i < n; ++i) {
-    x = x * 6364136223846793005ULL + 1442695040888963407ULL;  // COZ-LINE: P
-  }
+  for (int i = 0; i < n; ++i) x = x * kMulP + kAddP;  // COZ-LINE: P
   return x;
 }
 
 __attribute__((noinline)) uint64_t serial_work(uint64_t seed, int n) {
   uint64_t x = seed;
-  for (int i = 0; i < n; ++i) {
-    x = (x ^ (x >> 13)) * 0x9E3779B97F4A7C15ULL + i;  // COZ-LINE: S
-  }
+  for (int i = 0; i < n; ++i) x = (x ^ (x >> 13)) * kMulS + i;  // COZ-LINE: S
   return x;
 }
 
