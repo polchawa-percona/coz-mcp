@@ -1,0 +1,3 @@
+[submodule "coz"]
+	path = coz
+	url = git@github.com:polchawa-percona/coz.git

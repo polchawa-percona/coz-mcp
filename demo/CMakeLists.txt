@@ -1,0 +1,8 @@
+add_executable(demo demo.cc)
+target_compile_features(demo PRIVATE cxx_std_17)
+target_compile_options(demo PRIVATE -g -fno-omit-frame-pointer)
+target_link_libraries(demo PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+if(COZ_MCP_LATCH_HOOKS)
+  target_compile_definitions(demo PRIVATE DEMO_HAVE_COZ_LATCH)
+  target_include_directories(demo PRIVATE ${PROJECT_SOURCE_DIR}/coz/include)
+endif()

@@ -1,0 +1,23 @@
+[project]
+name = "coz-mcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Paweł Olchawa", email = "pawel.olchawa@percona.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=2",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.24,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "anyio>=4.15.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
