@@ -46,3 +46,4 @@
 - bank pthread probes (quiet): +19.5, +19.4, +26.4. x 0.19-0.26. S samples per txn in 30% runs drop up to 16% vs 0% runs in some runs (5.13 vs 6.13 per ktxn), P samples per txn rise; samples per user-CPU-s constant (988). Not seen in propagate runs. Unexplained.
 - Decision (advisor): bank opt-in, default propagate; validate exit code on plain column; libcoz column informational. Rebuilt; ctest 5/5, pytest 63 passed; default verified propagate (2.0 s global vs 0.34 s credit).
 - Next: README table, commit coz submodule + main repo, push, delete build dir.
+- DONE: coz 5ffaad5 (coz-mcp-speedup-underprediction), main dac5f74 (speedup-underprediction) pushed; build dir deleted. Open items in REQUIREMENTS Implementation Plan step 5 and FINDINGS sections 8-9.
