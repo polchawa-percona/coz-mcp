@@ -42,6 +42,24 @@ def _check_args(args: Sequence[str]) -> None:
             )
 
 
+def parse_cpus(spec: str) -> set[int]:
+    """CPU list like "8-13,20" -> {8, 9, 10, 11, 12, 13, 20}."""
+    cpus: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-")
+            cpus.update(range(int(lo), int(hi) + 1))
+        elif part:
+            cpus.add(int(part))
+    return cpus
+
+
+def _pin(spec: str) -> Callable[[], None]:
+    cpus = parse_cpus(spec)
+    return lambda: os.sched_setaffinity(0, cpus)
+
+
 class Workload:
     def __init__(
         self,
@@ -66,10 +84,8 @@ class Workload:
         return self._proc is not None and self._proc.returncode is None
 
     def command(self, extra_args: Sequence[str]) -> list[str]:
-        cmd = [self.config.binary, *self.config.base_args, *extra_args, *self.config.report_args]
-        if self.config.cpus:
-            cmd = ["taskset", "-c", self.config.cpus, *cmd]
-        return cmd
+        return [self.config.binary, *self.config.base_args, *extra_args,
+                *self.config.report_args]
 
     async def start(self, extra_args: Sequence[str]) -> list[str]:
         _check_args(extra_args)
@@ -86,6 +102,8 @@ class Workload:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env={**os.environ, **self.config.env} if self.config.env else None,
+            # Pin in the child, not via taskset: taskset would inherit LD_PRELOAD.
+            preexec_fn=_pin(self.config.cpus) if self.config.cpus else None,
         )
         self.args = list(extra_args)
         self.started_at = time.monotonic()

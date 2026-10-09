@@ -117,3 +117,20 @@ async def test_env_is_passed(tmp_path):
     await w.start([])
     await wait_finished(w)
     assert "X=42" in w.tail()
+
+
+def test_parse_cpus():
+    from coz_mcp.workload import parse_cpus
+    assert parse_cpus("8-10,20") == {8, 9, 10, 20}
+    assert parse_cpus("3") == {3}
+
+
+@pytest.mark.anyio
+async def test_cpus_pin_child(tmp_path):
+    script = tmp_path / "aff.py"
+    script.write_text("import os; print('cpus=' + ','.join(map(str, sorted(os.sched_getaffinity(0)))))")
+    cfg = WorkloadConfig(name="aff", binary=sys.executable, base_args=[str(script)], cpus="0-1")
+    w = Workload(cfg)
+    await w.start([])
+    await wait_finished(w)
+    assert "cpus=0,1" in w.tail()

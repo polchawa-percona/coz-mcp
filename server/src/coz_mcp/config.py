@@ -4,6 +4,7 @@ COZ_MCP_SOCKET        control socket of the target (default /tmp/coz-mcp.sock)
 COZ_MCP_WORKLOAD      "demo" (default) or "sysbench"
 COZ_MCP_BUILD_DIR     coz-mcp build dir with demo/demo and coz/libcoz/libcoz.so
 COZ_MCP_DEMO_ARGS     extra base args for the demo (space separated)
+COZ_MCP_DEMO_CPUS     taskset CPU list for the demo
 COZ_MCP_SYSBENCH      sysbench binary (default "sysbench")
 COZ_MCP_SYSBENCH_ARGS base args, e.g. "oltp_read_write --mysql-socket=... run"
 COZ_MCP_CLIENT_CPUS   taskset CPU list for the benchmark client (sysbench)
@@ -44,14 +45,17 @@ def coz_env(build_dir: str | Path, control_socket: str, profile: str,
 
 
 def demo_workload(build_dir: str | Path, control_socket: str, profile: str,
-                  base_args: list[str] | None = None) -> WorkloadConfig:
+                  base_args: list[str] | None = None,
+                  cpus: str | None = None,
+                  extra_env: dict[str, str] | None = None) -> WorkloadConfig:
     """The demo is both the profiled target and the benchmark."""
     return WorkloadConfig(
         name="demo",
         binary=str(Path(build_dir) / "demo" / "demo"),
         base_args=list(base_args or []),
         report_args=[],
-        env=coz_env(build_dir, control_socket, profile),
+        cpus=cpus,
+        env={**coz_env(build_dir, control_socket, profile), **(extra_env or {})},
     )
 
 
@@ -79,6 +83,7 @@ def from_env(environ: dict[str, str] | None = None) -> ServerConfig:
             build_dir, socket,
             env.get("COZ_MCP_PROFILE", "/tmp/coz-mcp-demo.coz"),
             shlex.split(env.get("COZ_MCP_DEMO_ARGS", "")),
+            env.get("COZ_MCP_DEMO_CPUS") or None,
         )
     elif kind == "sysbench":
         workload = sysbench_workload(
