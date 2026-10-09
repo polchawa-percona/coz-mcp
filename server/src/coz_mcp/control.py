@@ -31,7 +31,10 @@ class CozControl:
 
     async def _connect(self) -> None:
         try:
-            self._reader, self._writer = await asyncio.open_unix_connection(self.path)
+            # Replies (hot_lines, latch snapshots) can be far above the 64 KiB
+            # default line limit.
+            self._reader, self._writer = await asyncio.open_unix_connection(
+                self.path, limit=64 << 20)
         except OSError as e:
             raise CozUnavailable(f"cannot connect to {self.path}: {e}. {_HINT}") from e
 
@@ -44,6 +47,11 @@ class CozControl:
                 pass
         self._reader = self._writer = None
 
+    def _close_now(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+        self._reader = self._writer = None
+
     async def request(self, cmd: str, **args: Any) -> dict[str, Any]:
         payload = json.dumps({"cmd": cmd, **args}) + "\n"
         async with self._lock:
@@ -54,9 +62,14 @@ class CozControl:
                 self._writer.write(payload.encode())
                 await self._writer.drain()
                 line = await asyncio.wait_for(self._reader.readline(), self.timeout)
-            except (OSError, asyncio.TimeoutError) as e:
+            except (OSError, asyncio.TimeoutError, ValueError) as e:
                 await self.close()
                 raise CozUnavailable(f"control socket {self.path} failed: {e!r}") from e
+            except BaseException:
+                # Cancelled mid-request: the reply would be read by the next
+                # request, so drop the connection instead.
+                self._close_now()
+                raise
             if not line:
                 await self.close()
                 raise CozUnavailable(f"control socket {self.path} closed the connection")

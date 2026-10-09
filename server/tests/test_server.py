@@ -294,3 +294,20 @@ async def test_latch_poller_publishes_updates(fakes):
                     break
         text = (await c.read_resource("coz://latches/top")).contents[0].text
         assert "trx_sys_mutex" in json.loads(text)["hold"]["latches"][0]["name"]
+
+
+async def test_cancelled_experiment_stops_coz(client, fakes):
+    coz, _ = fakes
+    data(await client.call_tool("start_workload", {"args": []}))
+    t = asyncio.create_task(client.call_tool("run_experiment", {
+        "line": "a.cc:10", "kind": "slowdown", "percent": 50,
+        "duration_s": 5, "repeats": 1, "warmup_s": 0}))
+    async with asyncio.timeout(2):
+        while coz.active is None:
+            await asyncio.sleep(0.01)
+    t.cancel()
+    with pytest.raises(BaseException):
+        await t
+    async with asyncio.timeout(2):
+        while coz.active is not None:
+            await asyncio.sleep(0.01)

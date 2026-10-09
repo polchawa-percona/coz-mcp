@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import ctypes
 import os
+import signal
 import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Sequence
@@ -14,6 +16,8 @@ from .metrics import Sample
 from .report import parse_report_line
 
 DelaySampler = Callable[[], Awaitable[int]]
+
+PR_SET_PDEATHSIG = 1
 
 
 class WorkloadError(Exception):
@@ -55,9 +59,17 @@ def parse_cpus(spec: str) -> set[int]:
     return cpus
 
 
-def _pin(spec: str) -> Callable[[], None]:
-    cpus = parse_cpus(spec)
-    return lambda: os.sched_setaffinity(0, cpus)
+def _child_setup(cpus_spec: str | None) -> Callable[[], None]:
+    """Runs in the child before exec: die with the server, optionally pin CPUs."""
+    cpus = parse_cpus(cpus_spec) if cpus_spec else None
+
+    def setup() -> None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+        if cpus:
+            os.sched_setaffinity(0, cpus)
+
+    return setup
 
 
 class Workload:
@@ -75,6 +87,7 @@ class Workload:
         self._proc: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task | None = None
         self._last_t_s = 0
+        self._t0: float | None = None  # monotonic time of the benchmark's t=0
         self.args: list[str] = []
         self.started_at: float | None = None
         self.exit_code: int | None = None
@@ -95,6 +108,7 @@ class Workload:
         self._samples.clear()
         self._lines.clear()
         self._last_t_s = 0
+        self._t0 = None
         self.exit_code = None
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -103,7 +117,7 @@ class Workload:
             stderr=asyncio.subprocess.STDOUT,
             env={**os.environ, **self.config.env} if self.config.env else None,
             # Pin in the child, not via taskset: taskset would inherit LD_PRELOAD.
-            preexec_fn=_pin(self.config.cpus) if self.config.cpus else None,
+            preexec_fn=_child_setup(self.config.cpus),
         )
         self.args = list(extra_args)
         self.started_at = time.monotonic()
@@ -132,9 +146,15 @@ class Workload:
                 continue
             interval = float(rep.t_s - self._last_t_s) if rep.t_s > self._last_t_s else 1.0
             self._last_t_s = rep.t_s
+            # Use the benchmark's own clock, anchored at the first report:
+            # lines read late (while the delay sampler waited) must not move
+            # their interval into a later measurement window.
+            if self._t0 is None:
+                self._t0 = now - rep.t_s
+            t_end = min(now, self._t0 + rep.t_s)
             delay = await self._sample_delay()
             self._samples.append(
-                Sample(t_end=now, interval_s=interval, rate=rep.rate, global_delay_ns=delay)
+                Sample(t_end=t_end, interval_s=interval, rate=rep.rate, global_delay_ns=delay)
             )
         self.exit_code = await proc.wait()
 

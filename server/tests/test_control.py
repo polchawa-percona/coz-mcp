@@ -27,13 +27,21 @@ class FakeCoz:
             self.requests.append(req)
             if req["cmd"] == "status":
                 resp = {"mode": "manual", "global_delay_ns": 42}
+            elif req["cmd"] == "big":
+                resp = {"lines": ["x" * 100 for _ in range(2000)]}
+            elif req["cmd"] == "slow":
+                await asyncio.sleep(0.3)
+                resp = {"slow": True}
             elif req["cmd"] == "drop":
                 writer.close()
                 return
             else:
                 resp = {"error": f"unknown cmd: {req['cmd']}"}
-            writer.write((json.dumps(resp) + "\n").encode())
-            await writer.drain()
+            try:
+                writer.write((json.dumps(resp) + "\n").encode())
+                await writer.drain()
+            except ConnectionError:
+                return  # client dropped the connection
         writer.close()
 
 
@@ -94,4 +102,25 @@ async def test_concurrent_requests_are_serialized(fake):
     c = CozControl(str(fake.path))
     results = await asyncio.gather(*(c.request("status") for _ in range(10)))
     assert all(r["global_delay_ns"] == 42 for r in results)
+    await c.close()
+
+
+@pytest.mark.anyio
+async def test_reply_larger_than_64k(fake):
+    c = CozControl(str(fake.path))
+    assert len((await c.request("big"))["lines"]) == 2000
+    assert (await c.request("status"))["mode"] == "manual"
+    await c.close()
+
+
+@pytest.mark.anyio
+async def test_cancelled_request_does_not_desync_replies(fake):
+    c = CozControl(str(fake.path))
+    t = asyncio.create_task(c.request("slow"))
+    await asyncio.sleep(0.05)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    # The late "slow" reply must not be returned for this request.
+    assert (await c.request("status"))["mode"] == "manual"
     await c.close()

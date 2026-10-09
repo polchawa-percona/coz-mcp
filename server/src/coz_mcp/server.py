@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+
+import anyio
 import json
 import statistics
 import time
@@ -99,7 +101,7 @@ def build_server(coz: Any, workload: Any, latch_poll_s: float = 5.0) -> MCPServe
                 before = await app.coz.request("latch_stats_snapshot")
                 await asyncio.sleep(latch_poll_s)
                 after = await app.coz.request("latch_stats_snapshot")
-            except (CozError, CozUnavailable):
+            except Exception:  # never let the poller die
                 continue
             for metric in ("wait", "hold"):
                 app.latches[metric] = rank_latches(before, after, metric=metric)
@@ -115,8 +117,7 @@ def build_server(coz: Any, workload: Any, latch_poll_s: float = 5.0) -> MCPServe
                 poller.cancel()
             # Never leave a benchmark running or a target slowed down.
             with contextlib.suppress(Exception):
-                if app.experiment_lock.locked():
-                    await app.coz.request("stop")
+                await app.coz.request("stop")  # errors if nothing is running
             with contextlib.suppress(Exception):
                 await app.workload.stop()
 
@@ -244,8 +245,9 @@ def build_server(coz: Any, workload: Any, latch_poll_s: float = 5.0) -> MCPServe
             await ctx.report_progress(len(plan), len(plan), "done")
 
         metric = "corrected_tps" if kind == "speedup" else "raw_tps"
-        base = [r[metric] for r in runs if r["percent"] == 0 and r[metric]]
-        target = [r[metric] for r in runs if r["percent"] == percent and r[metric]]
+        base = [r[metric] for r in runs if r["percent"] == 0 and r[metric] is not None]
+        target = [r[metric] for r in runs
+                  if r["percent"] == percent and r[metric] is not None]
         if not base or not target:
             raise ToolError("no complete benchmark intervals inside the measurement "
                             "windows; increase duration_s")
@@ -268,13 +270,18 @@ def build_server(coz: Any, workload: Any, latch_poll_s: float = 5.0) -> MCPServe
         started = await app.coz_request(
             "start", line=line, kind=kind, percent=pct,
             max_duration_s=warmup_s + duration_s + 30)
+        stopped: dict[str, Any] = {}
         try:
             await asyncio.sleep(warmup_s)
             t0 = loop.time()
             await asyncio.sleep(duration_s)
             t1 = loop.time()
         finally:
-            stopped = await app.coz_request("stop")
+            # Stop even if the tool call is being cancelled: the SDK cancels
+            # through anyio cancel scopes, which would also cancel this await
+            # and leave the target slowed down until Coz's auto-stop.
+            with anyio.CancelScope(shield=True), anyio.move_on_after(15):
+                stopped = await app.coz_request("stop")
         w = window_tps(app.workload.samples(), t0, t1, corrected=(kind == "speedup"))
         return {
             "percent": pct,
