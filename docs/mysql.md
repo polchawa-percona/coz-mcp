@@ -93,6 +93,12 @@ are noisy):
 - `latch_top` wait: buffer block latches (`row0sel.cc`, `row0row.cc`,
   `btr0cur.cc`), the page hash latch (`buf0buf.cc`), the trx mutex.
 
+Experiment overhead on mysqld (oltp_read_write, 64 threads, quiet machine,
+single runs, estimates): 13,578 TPS without an experiment, 12,330 TPS during
+a 0% experiment (the cost of draining samples at latch transitions; baselines
+pay it too), 10,789 TPS with a 50% slowdown of `rem0cmp.cc:622` (record
+comparison during B-tree search).
+
 Known limitations:
 - Latches released by another thread (e.g. page latches released by I/O
   completion) show up as `unmatched_releases` and leave the owner's lock

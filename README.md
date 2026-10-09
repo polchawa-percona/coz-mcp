@@ -102,13 +102,16 @@ the same session (`scripts/validate_demo.py`):
 
 | case | coz-mcp | real change |
 |---|---|---|
-| slowdown 50% critical section, pthread | -34.1% | -31.5% |
-| slowdown 50% parallel code, pthread | -5.4% | -4.3% |
-| speedup 30% critical section, pthread | +38.2% | +40.8% |
-| slowdown 50% critical section, hooked spin lock | -26.4% | -29.5% |
-| speedup 30% critical section, hooked spin lock | +35.3% | +45.4% |
-| slowdown 50% critical section, spin lock without hooks | -8.1% | -29.6% |
+| slowdown 50% critical section, pthread | -39.7% | -30.9% |
+| slowdown 50% parallel code, pthread | -6.8% | -4.9% |
+| speedup 30% critical section, pthread | +29.9% | +40.9% |
+| slowdown 50% critical section, hooked spin lock | -30.9% | -29.7% |
+| speedup 30% critical section, hooked spin lock | +30.5% | +45.7% |
+| slowdown 50% critical section, spin lock without hooks | -8.4% | -29.6% |
 
+Slowdowns match the real change closely. Speedup predictions point the right
+way but under-estimate the gain by roughly a quarter to a third (the last
+checked case is at the edge of the tolerance; an earlier run gave +35%).
 The last row shows why custom locks need the hooks. With upstream Coz
 semantics (`COZ_LOCK_AWARE_DELAYS=0 COZ_SAMPLE_EVENT=task-clock`) the first
 three rows were -9%, -65% and -4%.
